@@ -1,0 +1,261 @@
+# %%
+# NIEZBEDNE IMPORTY
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from matplotlib import pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+
+from keras.models import load_model
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix
+)
+import tensorflow as tf
+from keras.layers import Normalization
+
+# %%
+# WCZYTANIE DANYCH
+
+df = pd.read_csv("../dataset/dataset_index_encoded_equalized.csv")
+#df = df.iloc[:6000,:]
+df = df.sample(n=10000, random_state=42).reset_index(drop=True)
+df
+
+# %%
+# PRZEJSCIE NA TYP NUMPY.NDARRAY
+data = df[["mfcc_eq_path", "age"]].to_numpy()
+data
+
+# %%
+# BADANIE ZROWNOWAZENIA ZBIORU
+print(np.bincount(data[:,1].astype(int)))
+
+# %%
+# PODZIAŁ NA ZBIÓR TRENINGOWY, TESTOWY I WALIDACYJNY
+
+X = data[:,0]
+y = data[:,1].astype(np.int32)
+
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X,
+    y,
+    test_size=0.25,
+    random_state=42,
+    stratify=y
+)
+
+# %%
+
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp,
+    y_temp,
+    test_size=0.60,
+    random_state=42,
+    stratify=y_temp
+)
+
+print(X_train.shape)
+print(X_val.shape)
+print(X_test.shape)
+
+# %%
+# WERYFIKACJA TYPOW DANYCH
+print(type(X_train[0]))
+print(X_train[0])
+
+# %%
+# USTALENIE WAG DLA NIEZRÓWNOWAŻONEGO ZBIORU DANYCH
+'''
+classes = np.unique(y_train)
+
+weights = compute_class_weight(
+    class_weight='balanced',
+    classes=classes,
+    y=y_train
+)
+
+class_weights = dict(zip(classes, weights))
+
+print(np.unique(y_train))
+print(class_weights)
+print(X_train.shape)
+'''
+# %%
+# PRZEJŚCIE NA TYP DATASET
+def load_numpy(path):
+    file = np.load(path.decode())
+    #print(file.shape)
+    return file.astype(np.float32)
+
+# DEFINICJA FUNKCJI MAPUJACEJ
+def load(path : str, label):
+    #path = path.replace("dataset","dataset_small")
+    tensor = tf.numpy_function(load_numpy, [path], tf.float32)
+    tensor.set_shape((20, 336))
+    tensor = tf.transpose(tensor)
+    return tensor, label
+
+# %%
+# TEST FUNKCJI MAPUJACEJ
+'''
+tensor, label = load(X_train[0], y_train[0])
+
+print(tensor.shape)
+print(label)
+'''
+
+# %%
+# ŁADOWANIE TENSORÓW RZĘDU DRUGIEGO (MACIERZY/TABLIC) W LOCIE PODCZAS TRENINGU
+train_dataset = (
+    tf.data.Dataset.from_tensor_slices((X_train, y_train))
+    .shuffle(10000)
+    .map(load, num_parallel_calls=tf.data.AUTOTUNE)
+    .batch(64)
+    .prefetch(tf.data.AUTOTUNE)
+)
+
+val_dataset = (
+    tf.data.Dataset.from_tensor_slices((X_val, y_val))
+    .map(load, num_parallel_calls=tf.data.AUTOTUNE)
+    .batch(64)
+    .prefetch(tf.data.AUTOTUNE)
+)
+
+test_dataset = (
+    tf.data.Dataset.from_tensor_slices((X_test, y_test))
+    .map(load, num_parallel_calls=tf.data.AUTOTUNE)
+    .batch(64)
+    .prefetch(tf.data.AUTOTUNE)
+)
+
+# %%
+# STANDARYZACJA TF.DATA.DATASET
+normalizer = Normalization(axis=-1)
+normalizer.adapt(train_dataset.map(lambda x, y: x))
+train_dataset = train_dataset.map(lambda x, y: (normalizer(x), y))
+test_dataset = test_dataset.map(lambda x, y: (normalizer(x), y))
+val_dataset = val_dataset.map(lambda x, y: (normalizer(x), y))
+
+x, y = next(iter(train_dataset))
+print("X shape:", x.shape)
+print("Y shape:", y)
+# %%
+# ŁADOWANIE MODELU I CALLBACKOW
+
+import rnn_mfcc_age
+
+model = rnn_mfcc_age.load_model()
+callbacks = rnn_mfcc_age.load_callbacks()
+
+model.summary()
+
+# %%
+# TRENOWANIE MODELU I ZAPIS HISTORII TRENINGU
+
+history = model.fit(
+    train_dataset,
+    validation_data=val_dataset,
+    epochs=100,
+    batch_size=16,
+    #class_weight=class_weights,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# %%
+# WCZYTANIE NAJLEPSZEGO MODELU I PREDYKCJA
+
+best_rnn_model = load_model("weights/best_mfcc_rnn_age_model.keras")
+
+y_proba = best_rnn_model.predict(test_dataset)
+y_pred = np.argmax(y_proba, axis=1)
+
+# %%
+# METRYKI
+
+y_test = np.concatenate([
+    y.numpy()
+    for _, y in test_dataset
+])
+
+
+
+# %%
+cm = confusion_matrix(y_test, y_pred)
+
+print("Accuracy :", accuracy_score(y_test, y_pred))
+print("Precision:", precision_score(y_test, y_pred, average="macro"))
+print("Recall   :", recall_score(y_test, y_pred, average="macro"))
+
+#tn, fp, fn, tp = cm.ravel()    # specificity przewaznie dla klasyfikacji binarnej sie wylicza tylko
+#specificity = tn / (tn + fp)
+
+#print(f"Specificity: {specificity:.4f}")
+print("F1-score :", f1_score(y_test, y_pred, average="macro"))
+
+# %%
+# MACIERZ POMYLEK
+labels_gender = [
+    "Female",
+    "Male",
+]
+
+labels_accent = [
+    "african",
+    "australia",
+    "bermuda",
+    "canada",
+    "england",
+    "hongkong",
+    "indian",
+    "ireland",
+    "malaysia",
+    "newzealand",
+    "philippines",
+    "scotland",
+    "singapore",
+    "southatlandtic",
+    "us",
+    "wales",
+]
+
+lables_age = [
+    "eighties",
+    "fifties",
+    "fourties",
+    "seventies",
+    "sixties",
+    "teens",
+    "thirties",
+    "twenties",
+]
+
+plt.figure(figsize=(7, 6))
+
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=lables_age,
+    yticklabels=lables_age,
+)
+
+plt.xlabel("Klasa przewidziana")
+plt.ylabel("Klasa prawdziwa")
+plt.title("Macierz pomylek - Sieć rekurencyjna dla współczynników MFCC")
+
+plt.tight_layout()
+plt.show()
+# %%
